@@ -1,372 +1,288 @@
-
-#include "chess/chess.h"
-#include "dataset/batchloader.h"
-#include "dataset/dataset.h"
-#include "dataset/io.h"
-#include "dataset/process.h"
-#include "misc/csv.h"
-#include "misc/timer.h"
-#include "nn/nn.h"
-#include "operations/operations.h"
+#include "argparse.hpp"
 #include "dataset/binpackloader.h"
+#include "dataset/io.h"
+#include "models/berserk.h"
+#include "models/koimodel.h"
+#include "models/Seraphina.h"
+#include "models/Seraphina-PSQT.h"
 
 #include <fstream>
-#include <algorithm>
+#include <limits>
+#include <omp.h>
 
 using namespace nn;
 using namespace data;
 
-/*
-int PSQTValues[5] = {126, 781, 825, 1276, 2538};
+void training_with_binpackloader(argparse::ArgumentParser& program,
+                                 std::vector<std::string>& train_files,
+                                 std::vector<std::string>& val_files) {
 
-data::DenseMatrix<float> values {0, 0};
-binpack::chess::Color side;
+    const std::string model_type          = program.get<std::string>("--model");
+    const int   total_epochs              = program.get<int>("--epochs");
+    const int   epoch_size                = program.get<int>("--epoch-size");
+    const int   val_epoch_size            = program.get<int>("--val-size");
+    const int   save_rate                 = program.get<int>("--save-rate");
+    const int   ft_size                   = program.get<int>("--ft-size");
+    const float startlambda               = program.get<float>("--startlambda");
+    const float endlambda                 = program.get<float>("--endlambda");
+    const float lr                        = program.get<float>("--lr");
+    const int   batch_size                = program.get<int>("--batch-size");
+    const int   lr_drop_epoch             = program.get<int>("--lr-drop-epoch");
+    const float lr_drop_ratio             = program.get<float>("--lr-drop-ratio");
+    const int   binpackloader_concurrency = program.get<int>("--concurrency");
+    const int   random_fen_skipping       = program.get<int>("--skip");
+    const int   early_fen_skipping        = program.get<int>("--early-skip");
 
-data::DenseMatrix<float> PSQT();
-data::DenseMatrix<float> getinitialPSQTValues();
-*/
+    std::cout << "Binpackloader Concurrency: " << binpackloader_concurrency << "\n" << std::endl;
 
-struct ChessModelBinpack : nn::Model {
-    int   current_epoch = 0;
-    int   max_epochs    = 0;
-
-    // seting inputs
-    virtual void setup_inputs_and_outputs(binpackloader::DataSet& positions) = 0;
-
-    // train function
-    void train(binpackloader::BinpackLoader& train_loader,
-               binpackloader::BinpackLoader& val_loader,
-               int                            epochs       = 1000,
-               int                            train_epoch_size   = 1e8,
-               int                            val_epoch_size = 1e7) {
-        this->compile(train_loader.batch_size);
-
-        max_epochs = epochs;
-
-        Timer t {};
-        for (int i = 1; i <= epochs; i++) {
-            t.start();
-
-            current_epoch             = i;
-
-            uint64_t prev_print_tm    = 0;
-            float    total_epoch_loss = 0;
-            float    total_val_loss   = 0;
-
-            // Training phase
-            for (int b = 1; b <= train_epoch_size / train_loader.batch_size; b++) {
-                auto ds = train_loader.next();
-                setup_inputs_and_outputs(ds);
-
-                float batch_loss = batch();
-                total_epoch_loss += batch_loss;
-                float epoch_loss = total_epoch_loss / b;
-
-                t.stop();
-                uint64_t elapsed = t.elapsed();
-                if (elapsed - prev_print_tm > 1000 || b == train_epoch_size / train_loader.batch_size) {
-                    prev_print_tm = elapsed;
-
-                    printf("\rep/ba = [%3d/%5d], ", i, b);
-                    printf("batch_loss = [%1.8f], ", batch_loss);
-                    printf("epoch_loss = [%1.8f], ", epoch_loss);
-                    printf("speed = [%7.2f it/s], ", 1000.0f * b / elapsed);
-                    printf("time = [%3ds]", (int) (elapsed / 1000.0f));
-                    
-                    /*
-                    * printf("\rep = [%4d], epoch_loss = [%1.8f], batch = [%5d], batch_loss = [%1.8f], "
-                           "speed = [%7.2f it/s], time = [%3ds]",
-                           i,
-                           epoch_loss,
-                           b,
-                           batch_loss,
-                           1000.0f * b / elapsed,
-                           (int) (elapsed / 1000.0f));
-                    */
-
-                    std::cout << std::flush;
-                }
-            }
-
-            // Validation phase
-            for (int b = 1; b <= val_epoch_size / val_loader.batch_size; b++) {
-                auto ds = val_loader.next();
-                setup_inputs_and_outputs(ds);
-
-                float val_batch_loss = loss();
-                total_val_loss += val_batch_loss;
-            }
-
-            float epoch_loss = total_epoch_loss / (train_epoch_size / train_loader.batch_size);
-            float val_loss   = total_val_loss / (val_epoch_size / val_loader.batch_size);
-
-            printf(", val_loss = [%1.8f]", val_loss);
-            next_epoch(epoch_loss, val_loss);
-            std::cout << std::endl;
-        }
+    if (random_fen_skipping) {
+        std::cout << "Random FEN Skipping: " << random_fen_skipping << std::endl;
+    } else {
+        std::cout << "Random FEN Skipping: False" << std::endl;
     }
-};
+    std::cout << "Early FEN Skipping: " << early_fen_skipping << std::endl;
 
-struct SeraphinaModel : ChessModelBinpack {
-    static constexpr int THREADS = 16;    // threads to use on the cpu
+    binpackloader::BinpackLoader train_loader {train_files,
+                                               batch_size,
+                                               binpackloader_concurrency,
+                                               early_fen_skipping,
+                                               random_fen_skipping};
+    train_loader.start();
 
-    SparseInput*         in1;
-    SparseInput*         in2;
-
-    SeraphinaModel() : ChessModelBinpack() {
-        in1      = add<SparseInput>(32 * 12 * 64, 32);
-        in2      = add<SparseInput>(32 * 12 * 64, 32);
-
-        /*
-        auto ftpsqt = add<FeatureTransformer>(in1, in2, 8);
-        ftpsqt->weights.values = getinitialPSQTValues();
-        auto ftpsqtl = add<Linear>(ftpsqt);
-        auto ftpsqtout = add<Affine>(ftpsqtl, 1);
-        */
-
-        // auto psqtws = add<WeightedSum>(ftpsqt->out_1, ftpsqt->out_2, (int)side - 0.5, -((int)side - 0.5));
-
-        auto ft  = add<FeatureTransformer>(in1, in2, 1536);
-        auto ftc = add<ClippedRelu>(ft);
-        // ft->ft_regularization = 1.0 / 16384.0 / 4194304.0;
-        ftc->max  = 127.0;
-
-        auto l1t = add<Affine>(ftc, 16);
-        auto l1d = add<Affine>(l1t, 1);
-        auto l1   = add<Affine>(l1t, 15);
-        auto l1sc  = add<SqrClippedRelu>(l1);
-        auto l1c  = add<ClippedRelu>(l1);
-
-        std::memcpy(l1sc + 15, l1c, 15 * sizeof(std::uint8_t));
-
-        auto l2  = add<Affine>(l1sc, 32);
-        auto l2c = add<ClippedRelu>(l2);
-
-        auto l3  = add<Affine>(l2c, 1);
-        auto l3c = add<WeightedSum>(l3, l1d, 1.0, 1.0);
-        // auto l3temp = add<Affine>(l3c, 1);
-        // auto l3t = add<WeightedSum>(l3temp, ftpsqtout, 1.0, 1.0);
-        // auto l3s = add<Sigmoid>(l3c, 1.0 / 160.0);
-
-        set_loss(MPE {2.5, true});
-        set_lr_schedule(StepDecayLRSchedule {4.375e-4, 0.995, 1});
-        const float hidden_max = 127.0 / 64.0;
-        add_optimizer(Adam(
-            {{OptimizerEntry {&ft->weights}},
-             {OptimizerEntry {&ft->bias}},
-             {OptimizerEntry {&l1->weights}.clamp(-hidden_max, hidden_max)},
-             {OptimizerEntry {&l1->bias}},
-             {OptimizerEntry {&l2->weights}.clamp(-hidden_max, hidden_max)},
-             {OptimizerEntry {&l2->bias}},
-             {OptimizerEntry {&l3->weights}.clamp(-(127 * 127) / 9600, (127 * 127) / 9600)},
-             {OptimizerEntry {&l3->bias}}},
-            0.9,
-            0.999,
-            1e-7));
-
-        set_file_output("D:\\Grapheus-Seraphina\\cmake-build-release\\Release\\nnue");
-        add_quantization(Quantizer {
-            "quant_1",
-            10,
-            QuantizerEntry<int16_t>(&ft->weights.values, 64.0, true),
-            QuantizerEntry<int16_t>(&ft->bias.values, 64.0),
-            QuantizerEntry<int8_t>(&l1->weights.values, 64.0),
-            QuantizerEntry<int32_t>(&l1->bias.values, 64.0),
-            QuantizerEntry<int8_t>(&l2->weights.values, 64.0),
-            QuantizerEntry<int32_t>(&l2->bias.values, 64.0),
-            QuantizerEntry<int8_t>(&l3->weights.values, 1.0),
-            QuantizerEntry<int32_t>(&l3->bias.values, 64.0),
-        });
-        set_save_frequency(10);
+    std::optional<binpackloader::BinpackLoader> val_loader;
+    if (val_files.size() > 0) {
+        val_loader.emplace(val_files,
+                           batch_size,
+                           binpackloader_concurrency,
+                           early_fen_skipping,
+                           random_fen_skipping);
+        val_loader->start();
     }
 
-    static int king_square_index(chess::Square relative_king_square) {
-
-        // clang-format off
-        constexpr int indices[chess::N_SQUARES] {
-            -1, -1, -1, -1, 31, 30, 29, 28,
-            -1, -1, -1, -1, 27, 26, 25, 24,
-            -1, -1, -1, -1, 23, 22, 21, 20,
-            -1, -1, -1, -1, 19, 18, 17, 16,
-            -1, -1, -1, -1, 15, 14, 13, 12,
-            -1, -1, -1, -1, 11, 10, 9, 8,
-            -1, -1, -1, -1, 7, 6, 5, 4,
-            -1, -1, -1, -1, 3, 2, 1, 0,
-        };
-        // clang-format on
-
-        return indices[relative_king_square];
-    }
-
-    static int index(chess::Square piece_square,
-                     chess::Piece  piece,
-                     chess::Square king_square,
-                     chess::Color  view) {
-
-        const chess::PieceType piece_type  = chess::type_of(piece);
-        const chess::Color     piece_color = chess::color_of(piece);
-
-        piece_square ^= 56;
-        king_square ^= 56;
-
-        const int oP  = piece_type + 6 * (piece_color != view);
-        const int oK  = (7 * !(king_square & 4)) ^ (56 * view) ^ king_square;
-        const int oSq = (7 * !(king_square & 4)) ^ (56 * view) ^ piece_square;
-
-        return king_square_index(oK) * 12 * 64 + oP * 64 + oSq;
-    }
-
-    /*
-    void getside(binpackloader::DataSet& positions) {
-        for (int b = 0; b < positions.size(); b++) {
-            const auto entry = positions[b];
-            side             = entry.pos.sideToMove();
-        }
-    }
-    */
-
-    void setup_inputs_and_outputs(binpackloader::DataSet& positions) {
-        in1->sparse_output.clear();
-        in2->sparse_output.clear();
-
-        auto&             target               = m_loss->target;
-
-#pragma omp parallel for schedule(static) num_threads(16)
-        for (int b = 0; b < positions.size(); b++) {
-            const auto       entry = positions[b];
-
-            binpackloader::BinpackLoader::set_features(b, entry, in1, in2, index);
-
-            float p_value  = binpackloader::BinpackLoader::get_p_value(positions[b]);
-            float w_value  = binpackloader::BinpackLoader::get_w_value(positions[b]);
-
-            // float lambda   = 1.0;
-
-            float p        = (p_value - 270) / 380;
-            float pm       = (-p_value - 270) / 380;
-            float p_target = 0.5 * (1.0 + 1 / (1 + expf(-p)) - 1 / (1 + expf(-pm)));
-            // float p_target = 1 / (1 + expf(-p_value * 1.0 / 410.0));
-
-            float w        = (w_value - 270) / 340;
-            float wm       = (-w_value - 270) / 340;
-            float w_target = 0.5 * (1.0 + 1 / (1 + expf(-w)) - 1 / (1 + expf(-wm)));
-            // float w_target = (w_value + 1) / 2.0f;
-
-            float actual_lambda = 1.0 + (1.0 - 0.7) * (current_epoch / max_epochs);
-
-            target(b) = (actual_lambda * p_target + (1.0f - actual_lambda) * w_target) / 1.0f;
-            // target(b) = lambda * p_target + (1.0 - lambda) * w_target;
-        }
-    }
-};
-
-/*
-// Piece Square Table
-data::DenseMatrix<float> PSQT()
-{
-    int indexw = 0;
-    int indexb = 0;
-
-    for (int ks = 0; ks < 64; ks++)
+    if (model_type == "Seraphina")
     {
-        for (int s = 0; s < 64; s++)
-        {
-            for (int pv : PSQTValues)
-            {
-                if (pv == PSQTValues[0])
-                {
-                    indexw = SeraphinaModel::index(s, chess::PAWN, ks, chess::WHITE);
-                    indexb = SeraphinaModel::index(s, chess::PAWN, ks, chess::BLACK);
-                }
+        model::SeraphinaModel model {train_loader,
+                                 val_loader,
+                                 ft_size,
+                                 startlambda,
+                                 endlambda,
+                                 save_rate};
 
-                if (pv == PSQTValues[1])
-                {
-                    indexw = SeraphinaModel::index(s, chess::KNIGHT, ks, chess::WHITE);
-                    indexb = SeraphinaModel::index(s, chess::KNIGHT, ks, chess::BLACK);
-                }
+        model.set_loss(MPE {2.5, true});
+        model.set_lr_schedule(StepDecayLRSchedule {lr, lr_drop_ratio, lr_drop_epoch});
 
-                if (pv == PSQTValues[2])
-                {
-                    indexw = SeraphinaModel::index(s, chess::BISHOP, ks, chess::WHITE);
-                    indexb = SeraphinaModel::index(s, chess::BISHOP, ks, chess::BLACK);
-                }
+        auto output_dir = program.get("--output");
+        model.set_file_output(output_dir);
+        for (auto& quantizer : model.m_quantizers)
+            quantizer.set_path(output_dir);
 
-                if (pv == PSQTValues[3])
-                                {
-                                        indexw = SeraphinaModel::index(s, chess::ROOK, ks,
-chess::WHITE); indexb = SeraphinaModel::index(s, chess::ROOK, ks, chess::BLACK);
-                                }
+        std::cout << "Files will be saved to " << output_dir << std::endl;
 
-                if (pv == PSQTValues[4])
-                {
-                    indexw = SeraphinaModel::index(s, chess::QUEEN, ks, chess::WHITE);
-                                        indexb = SeraphinaModel::index(s, chess::QUEEN, ks,
-chess::BLACK);
-                }
-
-                values[indexw] = pv;
-                values[indexb] = -pv;
-            }
+        if (auto previous = program.present("--resume")) {
+            model.load_weights(*previous);
+            std::cout << "Loaded weights from previous " << *previous << std::endl;
         }
+
+        model.train(total_epochs, epoch_size, val_epoch_size);
+    }
+    else if (model_type == "Seraphina-PSQT")
+    {
+        model::SeraphinaPSQTModel model {train_loader,
+                                         val_loader,
+                                         ft_size,
+                                         startlambda,
+                                         endlambda,
+                                         save_rate};
+
+        model.set_loss(MPE {2.5, true});
+        model.set_lr_schedule(StepDecayLRSchedule {lr, lr_drop_ratio, lr_drop_epoch});
+
+        auto output_dir = program.get("--output");
+        model.set_file_output(output_dir);
+        for (auto& quantizer : model.m_quantizers)
+            quantizer.set_path(output_dir);
+
+        std::cout << "Files will be saved to " << output_dir << std::endl;
+
+        if (auto previous = program.present("--resume")) {
+            model.load_weights(*previous);
+            std::cout << "Loaded weights from previous " << *previous << std::endl;
+        }
+
+        model.train(total_epochs, epoch_size, val_epoch_size);
+    }
+}
+
+int main(int argc, char* argv[]) {
+    argparse::ArgumentParser program("Grapheus");
+
+    program.add_argument("--model").default_value("Seraphina").help("Choose your Model");
+    program.add_argument("--data").required().help("Directory containing training files");
+    program.add_argument("--val-data").help("Directory containing validation files");
+    program.add_argument("--output").required().help("Output directory for network files");
+    program.add_argument("--resume").help("Weights file to resume from");
+    program.add_argument("--epochs")
+        .default_value(800)
+        .help("Total number of epochs to train for")
+        .scan<'i', int>();
+    program.add_argument("--concurrency")
+        .default_value(16)
+        .help("Sets the number of threads the sf binpack dataloader will use (if using the sf "
+              "binpack dataloader.)")
+        .scan<'i', int>();
+    program.add_argument("--epoch-size")
+        .default_value(100000000)
+        .help("Total positions in each epoch")
+        .scan<'i', int>();
+    program.add_argument("--val-size")
+        .default_value(10000000)
+        .help("Total positions for each validation epoch")
+        .scan<'i', int>();
+    program.add_argument("--save-rate")
+        .default_value(10)
+        .help("How frequently to save quantized networks + weights")
+        .scan<'i', int>();
+    program.add_argument("--ft-size")
+        .default_value(1536)
+        .help("Number of neurons in the Feature Transformer")
+        .scan<'i', int>();
+    program.add_argument("--startlambda")
+        .default_value(1.0f)
+        .help("Ratio of evaluation at the start of the training (if applicable to the model being "
+              "used)")
+        .scan<'f', float>();
+    program.add_argument("--endlambda")
+        .default_value(0.7f)
+        .help("Ratio of evaluation interpolated by the end of the training (if applicable to the "
+              "model being used)")
+        .scan<'f', float>();
+    program.add_argument("--lr")
+        .default_value(0.001f)
+        .help("The starting learning rate for the optimizer")
+        .scan<'f', float>();
+    program.add_argument("--batch-size")
+        .default_value(16384)
+        .help("Number of positions in a mini-batch during training")
+        .scan<'i', int>();
+    program.add_argument("--lr-drop-epoch")
+        .default_value(500)
+        .help("Epoch to execute an LR drop at")
+        .scan<'i', int>();
+    program.add_argument("--lr-drop-ratio")
+        .default_value(0.025f)
+        .help("How much to scale down LR when dropping")
+        .scan<'f', float>();
+    program.add_argument("--skip").default_value(0).help("Skip fens randomly").scan<'i', int>();
+    program.add_argument("--early-skip")
+        .default_value(16)
+        .help("Skip fens at the start of the training")
+        .scan<'i', int>();
+
+    try {
+        program.parse_args(argc, argv);
+    } catch (const std::exception& err) {
+        std::cerr << err.what() << std::endl;
+        std::cerr << program;
+        std::exit(1);
     }
 
-    return values;
-}
+    math::seed(0);
 
-data::DenseMatrix<float> getinitialPSQTValues()
-{
-    return (PSQT() + 64 * 12) / 600;
-}
-*/
-
-int main() {
     init();
 
     // Fetch training dataset paths
-    std::string tf = "E:/trainingdata/S4/leela96-dfrc99-v2-T78juntosepT79mayT80junsepnovjan-v6dd-T80mar23-v6-T60novdecT77decT78aprmayT79aprT80may23.min.binpack";
-    std::vector<std::string> train_file = {tf};
+    std::vector<std::string> train_files = dataset::fetch_dataset_paths(program.get("--data"));
+    bool                     is_binpack  = false;
+
+    // Print training dataset file list if files are found
+    if (!train_files.empty()) {
+        std::cout << "Training Dataset Files:" << std::endl;
+
+        for (const auto& file : train_files) {
+            std::cout << file << std::endl;
+
+            if (file.find(".binpack") != std::string::npos) {
+                is_binpack = true;
+            }
+        }
+
+        std::cout << "Total training files: " << train_files.size() << std::endl;
+
+        // can't count total positions in binpack files
+        if (!is_binpack) {
+            std::cout << "Total training positions: " << dataset::count_total_positions(train_files)
+                      << std::endl
+                      << std::endl;
+        }
+    } else {
+        std::cout << "No training files found in " << program.get("--data") << std::endl << std::endl;
+        exit(0);
+    }
 
     // Fetch validation dataset paths
-    std::string vf = "E:/trainingdata/S4/leela96-dfrc99-v2-T78juntosepT79mayT80junsepnovjan-v6dd-T80mar23-v6-T60novdecT77decT78aprmayT79aprT80may23.min.binpack";
-    std::vector<std::string> val_file = {vf};
+    std::vector<std::string> val_files;
 
-    binpackloader::BinpackLoader train_loader {train_file, 16384, 16};
-    train_loader.start();
+    if (program.present("--val-data")) {
+        val_files = dataset::fetch_dataset_paths(program.get("--val-data"));
+    }
 
-    binpackloader::BinpackLoader val_loader {val_file, 16384, 16};
-    val_loader.start();
+    // Print validation dataset file list if files are found
+    if (!val_files.empty()) {
+        std::cout << "Validation Dataset Files:" << std::endl;
 
-   SeraphinaModel model {};
-    //    model.train(loader, 1000, 1e8);
-//    model.distribution(loader, 32);
+        for (const auto& file : val_files) {
+            std::cout << file << std::endl;
 
-//    model.test_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-//    model.compile(16384);
-//    model.setup_inputs_and_outputs(loader.next());
-//    model.batch();
-//    std::cout << model.loss_of_last_batch() << std::endl;
+            if (file.find(".binpack") != std::string::npos && !is_binpack) {
+                std::cerr << "Validation dataset is binpack but training dataset is not. Exiting."
+                          << std::endl;
+                exit(1);
+            }
+        }
+        std::cout << "Total validation files: " << val_files.size() << std::endl;
+
+        // can't count total positions in binpack files
+        if (!is_binpack) {
+            std::cout << "Total validation positions: " << dataset::count_total_positions(val_files)
+                      << std::endl
+                      << std::endl;
+        }
+    }
+
+    const std::string model_type          = program.get<std::string>("--model");
+    const int   total_epochs              = program.get<int>("--epochs");
+    const int   epoch_size                = program.get<int>("--epoch-size");
+    const int   val_epoch_size            = program.get<int>("--val-size");
+    const int   save_rate                 = program.get<int>("--save-rate");
+    const int   ft_size                   = program.get<int>("--ft-size");
+    const float startlambda               = program.get<float>("--startlambda");
+    const float endlambda                 = program.get<float>("--endlambda");
+    const float lr                        = program.get<float>("--lr");
+    const int   batch_size                = program.get<int>("--batch-size");
+    const int   lr_drop_epoch             = program.get<int>("--lr-drop-epoch");
+    const float lr_drop_ratio             = program.get<float>("--lr-drop-ratio");
+    const int   binpackloader_concurrency = program.get<int>("--concurrency");
+
+    std::cout << "Model: " << model_type << "\n"
+              << "Epochs: " << total_epochs << "\n"
+              << "Epochs Size: " << epoch_size << "\n"
+              << "Validation Size: " << val_epoch_size << "\n"
+              << "Save Rate: " << save_rate << "\n"
+              << "FT Size: " << ft_size << "\n"
+              << "Start lambda: " << startlambda << "\n"
+              << "End lambda: " << endlambda << "\n"
+              << "LR: " << lr << "\n"
+              << "Batch: " << batch_size << "\n"
+              << "LR Drop @ " << lr_drop_epoch << "\n"
+              << "LR Drop R " << lr_drop_ratio << "\n"
+              << std::endl;
 
 
-
-//    model.load_weights("../res/run1/weights/test.state");
-//    model.test_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-//    model.train(loader, 1000, 1e8);
-    model.load_weights("D:/Grapheus-Seraphina/cmake-build-release/Release/nnue/weights/S3.state");
-    // model.distribution(loader, 84);
-//    model.quantize("Nyx.nnue");
-
-//    model.test_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-//    model.save_weights("../res/run1/weights/test.state");
-
-//    model.compile(1);
-//    model.load_weights(R"(C:\Users\Luecx\CLionProjects\Grapheus\res\run1\weights\300.state)");
-//    model.test_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-//
-//    model.load_weights(R"(C:\Users\Luecx\CLionProjects\Grapheus\res\run1\weights\200.state)");
-//    model.test_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-
-
-    model.train(train_loader, val_loader, 800, 1e8, 1e7);
+    if (is_binpack) {
+        training_with_binpackloader(program, train_files, val_files);
+    } else {
+        std::cerr << "Only binpack files are supported for training" << std::endl;
+    }
 
     close();
     return 0;

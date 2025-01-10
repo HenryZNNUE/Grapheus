@@ -203,7 +203,7 @@ struct Model {
     void next_epoch(float epoch_loss, float validation_loss = 0.0) {
         // quantitize weights
         quantize();
-        quantize("latest.net");
+        quantize("latest.nnue");
         write_epoch_result(epoch_loss, validation_loss);
         // save weights
         if (m_epoch % m_save_frequency == 0)

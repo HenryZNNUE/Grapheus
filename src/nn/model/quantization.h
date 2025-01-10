@@ -79,7 +79,7 @@ struct Quantizer {
 
     void save(int epoch) {
         if (epoch % frequency == 0) {
-            save("epoch_" + std::to_string(epoch) + ".net");
+            save("epoch_" + std::to_string(epoch) + ".nnue");
         }
     }
 

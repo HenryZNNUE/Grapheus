@@ -4,7 +4,8 @@
 
 namespace model {
 
-struct BerserkModel : ChessModel {
+struct BerserkModel : ChessModel<dataset::BatchLoader<chess::Position>> {
+    using DataLoader = dataset::BatchLoader<chess::Position>;
 
     SparseInput* in1;
     SparseInput* in2;
@@ -18,8 +19,15 @@ struct BerserkModel : ChessModel {
     const size_t n_l2          = 32;
     const size_t n_out         = 1;
 
-    BerserkModel(size_t n_ft, float lambda, size_t save_rate)
-        : ChessModel(lambda) {
+    float        lambda        = 0.5;
+
+    BerserkModel(DataLoader&                train_loader,
+                 std::optional<DataLoader>& val_loader,
+                 size_t                     n_ft,
+                 float                      lambda,
+                 size_t                     save_rate)
+        : ChessModel(train_loader, val_loader)
+        , lambda(lambda) {
 
         in1                    = add<SparseInput>(n_features, 32);
         in2                    = add<SparseInput>(n_features, 32);

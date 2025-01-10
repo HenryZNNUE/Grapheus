@@ -3,8 +3,9 @@
 
 # Compiler options
 NVCC = nvcc
-CXXFLAGS = -std=c++17 -fopenmp -march=native
-NVCCFLAGS = -use_fast_math -O3 -DNDEBUG
+CXX = g++
+CXXFLAGS = -std=c++17 -fopenmp -stdlib=libc++
+NVCCFLAGS = -use_fast_math -O3 -DNDEBUG --compiler-options -std=c++17
 
 # Combine CXXFLAGS into NVCCFLAGS
 NVCCFLAGS += $(addprefix --compiler-options ,$(CXXFLAGS))
@@ -18,17 +19,9 @@ OBJDIR = obj
 BINDIR = bin
 
 # Files
-SRCS := $(sort $(shell find $(SRCDIR) -name '*.cu'))
+SRCS := $(wildcard $(SRCDIR)/*.cu)
 OBJS := $(SRCS:$(SRCDIR)/%.cu=$(OBJDIR)/%.obj)
 EXE  := $(BINDIR)/Grapheus
-
-# Flag for using IMMINTRIN
-USE_IMMINTRIN ?= 1
-
-# If USE_IMMINTRIN is set to 0, add the -mno-avx flag
-ifeq ($(USE_IMMINTRIN), 0)
-	CXXFLAGS += -DNO_IMMINTRIN
-endif
 
 # Targets
 all: $(EXE)

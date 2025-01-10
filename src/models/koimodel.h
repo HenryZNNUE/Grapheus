@@ -4,12 +4,19 @@
 
 namespace model {
 
-struct KoiModel : ChessModel {
+struct KoiModel : ChessModel<dataset::BatchLoader<chess::Position>> {
+    using DataLoader = dataset::BatchLoader<chess::Position>;
     SparseInput* in1;
     SparseInput* in2;
 
-    KoiModel(float lambda, size_t save_rate)
-        : ChessModel(lambda) {
+    float        lambda = 0.5;
+
+    KoiModel(DataLoader&                train_loader,
+             std::optional<DataLoader>& val_loader,
+             float                      lambda,
+             size_t                     save_rate)
+        : ChessModel(train_loader, val_loader)
+        , lambda(lambda) {
         in1     = add<SparseInput>(16 * 12 * 64, 32);
         in2     = add<SparseInput>(16 * 12 * 64, 32);
 
