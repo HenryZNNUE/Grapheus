@@ -45,10 +45,10 @@ struct SeraphinaPSQTModel : ChessModel<binpackloader::BinpackLoader> {
         fta->max               = 127.0;
 
         auto        l1         = add<Affine>(fta, n_l1);
-        auto        l1a        = add<ReLU>(l1);
+        auto        l1a        = add<ClippedRelu>(l1);
 
         auto        l2         = add<Affine>(l1a, n_l2);
-        auto        l2a        = add<ReLU>(l2);
+        auto        l2a        = add<ClippedRelu>(l2);
 
         auto        pos_eval   = add<Affine>(l2a, n_out);
 
